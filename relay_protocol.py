@@ -79,3 +79,18 @@ def pack_data_frame(tunnel_id: bytes, payload: bytes) -> bytes:
 
 def unpack_data_frame(body: bytes) -> tuple[bytes, bytes]:
     return body[:16], body[16:]
+
+
+# ── WebSocket transport variant ──────────────────────────────────────────────
+# Used when the relay runs behind a platform (Render, etc.) that only exposes
+# HTTP(S)/WebSocket externally, rather than a raw TCP+TLS port. A WebSocket
+# message already has well-defined boundaries, so we don't need the 4-byte
+# length prefix used above for the raw-TCP framing — each frame is just its
+# 1-byte type plus body, sent as a single binary WS message.
+
+def pack_ws_message(frame_type: int, body: bytes) -> bytes:
+    return struct.pack(">B", frame_type) + body
+
+
+def unpack_ws_message(data: bytes) -> tuple[int, bytes]:
+    return data[0], data[1:]
