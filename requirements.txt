@@ -1,0 +1,4 @@
+# Requirements for the relay_server.py deployment (the shitufa-relay GitHub
+# repo on Render) — NOT the same requirements.txt as the desktop app.
+websockets>=13.0
+cryptography>=42.0.0
