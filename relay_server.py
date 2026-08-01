@@ -1,11 +1,13 @@
 """
-relay_server.py — Shitufa (שיתופא) relay server.
+relay_server.py — Shitufa (שיתופא) relay server (WebSocket transport).
 
-Run this manually on any machine reachable from the internet (a VPS, a home
-server with a forwarded port, etc.) when you want peers that AREN'T on the
-same local network to still be able to sync. Stop it whenever you don't
-want that fallback active — devices simply keep working over LAN discovery
-as before; the relay is 100% optional and stateless across restarts.
+Run this on any machine reachable from the internet — including a platform
+like Render that only exposes HTTP(S)/WebSocket externally (not arbitrary
+raw TCP ports). Peers who aren't reachable on the same local network can
+still be synced with over the internet through this relay. Stop it whenever
+you don't want that fallback active — devices simply keep working over LAN
+discovery as before; the relay is 100% optional and stateless across
+restarts.
 
 The relay is a BLIND multiplexing switch: it authenticates each device (by
 proving they hold the private key matching the public key they present —
@@ -15,69 +17,45 @@ application bytes between two devices' tunnels. It never decrypts,
 inspects, or stores any file/chat/group content — see the module docstring
 in relay_protocol.py for the exact framing.
 
+Transport note: this version speaks WebSocket instead of raw TCP+TLS. TLS
+itself is handled by the hosting platform (Render terminates HTTPS/WSS at
+its edge and forwards plain traffic to this process) — this script does
+NOT do its own TLS termination. If you deploy this on a plain VPS instead
+(with no TLS-terminating proxy in front of it), put it behind something
+like Caddy/nginx for wss://, or accept that connections will be ws://
+(unencrypted at the transport level — the RSA challenge/response still
+proves identity, but traffic itself won't be encrypted at this layer).
+
 Usage:
     python relay_server.py --port 57630
-    python relay_server.py --port 57630 --host 0.0.0.0
+    (Render and similar platforms set the $PORT env var automatically —
+    that takes priority over --port when present.)
 
-Requires only the `cryptography` package (already a dependency of the app).
+Requires: websockets, cryptography
 """
 
 import argparse
 import asyncio
 import base64
-import datetime
+import hashlib
+import json
 import logging
-import ssl
+import os
 import uuid
-from pathlib import Path
 
-from cryptography import x509
+import websockets
+from websockets.exceptions import ConnectionClosed
+
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.x509.oid import NameOID
 
 import relay_protocol as proto
 
 logger = logging.getLogger("relay_server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-CERT_DIR = Path("relay_certs")
-CERT_PATH = CERT_DIR / "relay_cert.pem"
-KEY_PATH = CERT_DIR / "relay_key.pem"
-
-
-def _ensure_relay_cert():
-    """Generate a self-signed cert for the relay's own TLS listener, once.
-    Clients don't verify this cert against a CA (same trust model the app
-    already uses peer-to-peer) — it only protects the link from casual
-    network eavesdropping; real identity is proven via the RSA challenge."""
-    if CERT_PATH.exists() and KEY_PATH.exists():
-        return
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    CERT_DIR.mkdir(parents=True, exist_ok=True)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "shitufa-relay")])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow())
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
-        .sign(key, hashes.SHA256(), default_backend())
-    )
-    KEY_PATH.write_bytes(
-        key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-    )
-    CERT_PATH.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    logger.info(f"Generated relay TLS cert at {CERT_DIR}/")
+MAX_MESSAGE_SIZE = 16 * 1024 * 1024  # 16MB — plenty for chunked file data
 
 
 def _verify_signature(public_pem: bytes, challenge: bytes, signature: bytes) -> bool:
@@ -109,94 +87,99 @@ class Tunnel:
 
 class RelayServer:
     def __init__(self):
-        self.clients: dict[str, asyncio.StreamWriter] = {}       # device_id -> control writer
-        self.write_locks: dict[str, asyncio.Lock] = {}            # one writer per socket -> needs a lock
-        self.tunnels: dict[bytes, Tunnel] = {}                    # tunnel_id -> Tunnel
+        self.clients: dict[str, "websockets.asyncio.server.ServerConnection"] = {}  # device_id -> websocket
+        self.write_locks: dict[str, asyncio.Lock] = {}   # one socket -> needs a lock for concurrent sends
+        self.tunnels: dict[bytes, Tunnel] = {}           # tunnel_id -> Tunnel
 
-    async def _send(self, device_id: str, frame_type: int, body: bytes):
-        writer = self.clients.get(device_id)
-        if not writer:
+    async def _send(self, device_id: str, frame_type: int, body: bytes) -> bool:
+        ws = self.clients.get(device_id)
+        if not ws:
             return False
         lock = self.write_locks.setdefault(device_id, asyncio.Lock())
         try:
             async with lock:
-                await proto.write_frame(writer, frame_type, body)
+                await ws.send(proto.pack_ws_message(frame_type, body))
             return True
         except Exception:
             return False
 
-    async def _send_json(self, device_id: str, frame_type: int, obj: dict):
-        return await self._send(device_id, frame_type, __import__("json").dumps(obj).encode())
+    async def _send_json(self, device_id: str, frame_type: int, obj: dict) -> bool:
+        return await self._send(device_id, frame_type, json.dumps(obj).encode())
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        peer = writer.get_extra_info("peername")
+    @staticmethod
+    def _as_bytes(raw) -> bytes:
+        return raw if isinstance(raw, bytes) else raw.encode("utf-8")
+
+    async def handle_client(self, websocket):
+        peer = websocket.remote_address
         device_id = None
         try:
-            frame_type, body = await proto.read_frame(reader)
+            raw = await websocket.recv()
+            frame_type, body = proto.unpack_ws_message(self._as_bytes(raw))
             if frame_type != proto.REGISTER:
-                writer.close()
+                await websocket.close()
                 return
             msg = proto.read_json_body(body)
             public_pem = base64.b64decode(msg["public_key"])
-
-            import hashlib
             device_id = hashlib.sha256(public_pem).hexdigest()[:16]
 
             nonce = uuid.uuid4().bytes + uuid.uuid4().bytes  # 32 random bytes
-            await proto.write_json_frame(writer, proto.CHALLENGE, {"nonce": base64.b64encode(nonce).decode()})
+            await websocket.send(proto.pack_ws_message(
+                proto.CHALLENGE, json.dumps({"nonce": base64.b64encode(nonce).decode()}).encode()
+            ))
 
-            frame_type, body = await proto.read_frame(reader)
+            raw = await websocket.recv()
+            frame_type, body = proto.unpack_ws_message(self._as_bytes(raw))
             if frame_type != proto.CHALLENGE_RESPONSE:
-                writer.close()
+                await websocket.close()
                 return
             resp = proto.read_json_body(body)
             signature = base64.b64decode(resp["signature"])
 
             if not _verify_signature(public_pem, nonce, signature):
-                await proto.write_json_frame(writer, proto.REGISTER_FAIL, {"reason": "bad_signature"})
-                writer.close()
+                await websocket.send(proto.pack_ws_message(
+                    proto.REGISTER_FAIL, json.dumps({"reason": "bad_signature"}).encode()
+                ))
+                await websocket.close()
                 return
 
             # Kick any stale connection for the same device_id (reconnect case)
             old = self.clients.get(device_id)
-            if old and old is not writer:
+            if old and old is not websocket:
                 try:
-                    old.close()
+                    await old.close()
                 except Exception:
                     pass
 
-            self.clients[device_id] = writer
-            await proto.write_json_frame(writer, proto.REGISTER_OK, {"device_id": device_id})
+            self.clients[device_id] = websocket
+            await websocket.send(proto.pack_ws_message(
+                proto.REGISTER_OK, json.dumps({"device_id": device_id}).encode()
+            ))
             logger.info(f"[Relay] Device {device_id[:8]} registered ({peer})")
 
-            await self._client_loop(device_id, reader, writer)
+            await self._client_loop(device_id, websocket)
 
-        except (asyncio.IncompleteReadError, ConnectionResetError):
+        except ConnectionClosed:
             pass
         except Exception as e:
             logger.debug(f"[Relay] Connection error ({peer}): {e}")
         finally:
-            if device_id and self.clients.get(device_id) is writer:
+            if device_id and self.clients.get(device_id) is websocket:
                 del self.clients[device_id]
                 logger.info(f"[Relay] Device {device_id[:8]} disconnected")
-                # Tear down any tunnels this device was party to
                 dead = [tid for tid, t in self.tunnels.items() if device_id in (t.device_a, t.device_b)]
                 for tid in dead:
                     t = self.tunnels.pop(tid, None)
                     if t:
                         other = t.other(device_id)
                         await self._send(other, proto.CLOSE, tid)
-            try:
-                writer.close()
-            except Exception:
-                pass
 
-    async def _client_loop(self, device_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        while True:
-            frame_type, body = await proto.read_frame(reader)
+    async def _client_loop(self, device_id: str, websocket):
+        async for raw in websocket:
+            frame_type, body = proto.unpack_ws_message(self._as_bytes(raw))
 
             if frame_type == proto.PING:
-                await proto.write_frame(writer, proto.PONG, b"")
+                await websocket.send(proto.pack_ws_message(proto.PONG, b""))
 
             elif frame_type == proto.OPEN:
                 msg = proto.read_json_body(body)
@@ -246,22 +229,18 @@ class RelayServer:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Shitufa relay server")
+    parser = argparse.ArgumentParser(description="Shitufa relay server (WebSocket)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=57630)
     args = parser.parse_args()
 
-    _ensure_relay_cert()
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(certfile=str(CERT_PATH), keyfile=str(KEY_PATH))
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    port = int(os.environ.get("PORT", args.port))
 
     server_state = RelayServer()
-    server = await asyncio.start_server(server_state.handle_client, args.host, args.port, ssl=ctx)
-    logger.info(f"[Relay] Listening on {args.host}:{args.port} (TLS)")
-    logger.info("[Relay] Stop with Ctrl+C whenever you don't want internet fallback active.")
-    async with server:
-        await server.serve_forever()
+    async with websockets.serve(server_state.handle_client, args.host, port, max_size=MAX_MESSAGE_SIZE):
+        logger.info(f"[Relay] Listening on {args.host}:{port} (WebSocket)")
+        logger.info("[Relay] Stop whenever you don't want internet fallback active.")
+        await asyncio.Future()  # run forever
 
 
 if __name__ == "__main__":
