@@ -162,7 +162,13 @@ class RelayServer:
         except ConnectionClosed:
             pass
         except Exception as e:
-            logger.debug(f"[Relay] Connection error ({peer}): {e}")
+            # NOTE: temporarily raised from logger.debug to logger.info so this
+            # actually shows up with the server's current logging.basicConfig
+            # level=logging.INFO. logger.debug() here was being silently
+            # swallowed, which is why repeated connect/close cycles produced
+            # no visible error at all. Revert to logger.debug once the root
+            # cause of the reconnect loop is found and fixed.
+            logger.info(f"[Relay] Connection error ({peer}): {e!r}")
         finally:
             if device_id and self.clients.get(device_id) is websocket:
                 del self.clients[device_id]
@@ -225,7 +231,7 @@ class RelayServer:
                     self.tunnels.pop(tunnel_id, None)
 
             else:
-                logger.debug(f"[Relay] Unknown frame type {frame_type} from {device_id[:8]}")
+                logger.info(f"[Relay] Unknown frame type {frame_type} from {device_id[:8]}")
 
 
 async def main():
