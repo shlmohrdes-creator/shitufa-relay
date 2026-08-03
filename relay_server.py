@@ -159,8 +159,18 @@ class RelayServer:
 
             await self._client_loop(device_id, websocket)
 
-        except ConnectionClosed:
-            pass
+        except ConnectionClosed as e:
+            # NOTE: temporarily logging this instead of silently passing —
+            # this is very likely why the reconnect-loop symptom showed no
+            # errors at all even after raising the other except-branch to
+            # logger.info: THIS branch was catching it first and discarding
+            # it. code/reason here should tell us whether the far side
+            # (client, Render's proxy, or an idle timeout) is the one
+            # closing the socket. Revert to `pass` once root-caused.
+            logger.info(
+                f"[Relay] ConnectionClosed for device={device_id[:8] if device_id else None} "
+                f"({peer}): code={getattr(e, 'code', None)} reason={getattr(e, 'reason', None)!r}"
+            )
         except Exception as e:
             # NOTE: temporarily raised from logger.debug to logger.info so this
             # actually shows up with the server's current logging.basicConfig
